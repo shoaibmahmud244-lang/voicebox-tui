@@ -1,0 +1,776 @@
+#!/usr/bin/env bash
+# voicebox — terminal voice studio over chatterbox.cpp
+# v2: + tuning studio (pitch/tempo/EQ/reverb/compression/loudness), emotion styles,
+#     full engine knobs, F0 measurement. Source takes are never modified.
+# v2.1: + local denoise (rnnoise/afftdn): clone prep, tuning menu item, --denoise
+set -euo pipefail
+
+ROOT="${VOICEBOX_ROOT:-$HOME/voice-clone/chatterbox.cpp}"
+BIN="$ROOT/build/chatterbox"
+MODEL="$ROOT/models/chatterbox-t3-turbo.gguf"
+S3GEN="$ROOT/models/chatterbox-s3gen.gguf"
+VOICES="$ROOT/voices"
+OUT="$HOME/voice-clone/out"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ASSETS="$SELF_DIR/assets"
+IR="$ASSETS/room.wav"
+MKIR="$ASSETS/mkir.py"
+F0PY="$ASSETS/f0.py"
+RNNDIR="${RNNOISE_DIR:-$HOME/.local/share/rnnoise}"
+RNNMODEL="${RNNOISE_MODEL:-$RNNDIR/bd.rnnn}"
+DN_MIX="${DN_MIX:-0.95}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/voicebox"
+THREADS="$(nproc 2>/dev/null || echo 4)"
+PINK=199
+TTY=0; [ -t 0 ] && [ -t 1 ] && TTY=1
+mkdir -p "$STATE" "$OUT"
+
+# ---- generation params (globals, overridden by emotion styles / custom) ----
+GEN_TOPK=1000
+GEN_TOPP=0.95
+GEN_RP=1.2
+GEN_NPRED=""
+GEN_EMO="Neutral"
+
+# ---- tuning params ----------------------------------------------------------
+T_PITCH=0        # semitones
+T_BODY=0         # dB @ 250 Hz (chest/body)
+T_TEMPO=1        # 1 = unchanged
+T_WARM=0         # dB @ 120 Hz
+T_PRES=0         # dB @ 6 kHz
+T_HARSH=0        # dB @ 3.2 kHz (negative = de-harsh / smoother)
+T_REV=0          # reverb wet %
+T_COMP=0         # compressor amount 0-100
+T_LUFS=0         # 0 = off, else target LUFS
+T_PRESET="custom"
+
+die() { gum style --foreground 196 "  $*"; exit 1; }
+info() { gum style --foreground "$PINK" "  $*"; }
+ok() { gum style --foreground 42 "  $*"; }
+pause() { gum input --prompt "  Enter to continue " --placeholder "" >/dev/null 2>&1 || true; }
+header() {
+  gum style --border rounded --border-foreground "$PINK" --padding "0 2" --margin "0 0 0 2" \
+    "VOICEBOX" "$(gum style --foreground 245 'local voice cloning · chatterbox turbo')"
+}
+num() { awk -v v="$1" 'BEGIN{exit !(v ~ /^-?[0-9]+(\.[0-9]+)?$/)}'; }
+take_val() { [ $# -ge 2 ] || die "missing value for $1"; }
+
+player() {
+  if command -v pw-play >/dev/null; then pw-play "$1" 2>/dev/null
+  elif command -v ffplay >/dev/null; then ffplay -nodisp -autoexit -loglevel quiet "$1" 2>/dev/null
+  else die "no audio player (pw-play or ffplay)"; fi
+}
+
+play_file() {
+  local f="$1"
+  [ -s "$f" ] || { info "no audio at $f"; return 1; }
+  local d; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo "?")
+  info "playing $(basename "$f")  (${d}s)   [Ctrl+C to stop]"
+  player "$f" || true
+}
+
+denoise_file() {  # $1 in, $2 out — new file; input never touched
+  local in="$1" out="$2" af
+  if [ -s "$RNNMODEL" ]; then
+    af="arnndn=m=$RNNMODEL:mix=$DN_MIX"
+  else
+    af="afftdn=nr=12:nf=-50:tn=1"
+  fi
+  ffmpeg -y -v error -i "$in" -af "$af" -c:a pcm_s16le "$out" 2>/dev/null || return 1
+  [ -s "$out" ]
+}
+
+# ---- engine helpers ---------------------------------------------------------
+prepare_runner() {  # $@ = args after the binary; writes $STATE/runner.sh
+  local runner="$STATE/runner.sh"
+  { echo '#!/usr/bin/env bash'
+    echo "cd $(printf '%q' "$ROOT")"
+    printf 'exec'
+    local a
+    for a in "$BIN" "$@"; do printf ' %q' "$a"; done
+    echo
+  } >"$runner"
+  chmod +x "$runner"
+  echo "$runner"
+}
+
+run_runner() {  # $1 = runner path, $2 = log path; respects TTY
+  local runner="$1" log="$2" rc=0 label="${3:-working}"
+  if [ "$TTY" = 1 ]; then
+    gum spin --spinner dot --spinner.foreground "$PINK" --title "$label" -- \
+      bash -c "$(printf '%q' "$runner") >$(printf '%q' "$log") 2>&1" || rc=$?
+  else
+    echo "$label" >&2
+    bash -c "$(printf '%q' "$runner") >$(printf '%q' "$log") 2>&1" || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    gum style --foreground 196 "  failed — log:"
+    if [ "$TTY" = 1 ]; then gum pager <"$log"; else tail -20 "$log"; fi
+    return 1
+  fi
+}
+
+measure_it() {  # prints "I TP"
+  ffmpeg -hide_banner -nostats -i "$1" -af ebur128=peak=true -f null - 2>&1 | \
+    awk '/I:/{i=$2} /Peak:/{p=$2} END{print (i==""?"-99":i)" "(p==""?"-99":p)}'
+}
+
+f0_of() { python3 "$F0PY" "$1" 2>/dev/null || echo 0; }
+
+metrics_of() {  # $1 file -> prints "I=.. TP=.. F0=.."
+  local m; m=$(measure_it "$1")
+  printf 'I=%s LUFS  TP=%s dBFS  F0=%s Hz' "${m%% *}" "${m##* }" "$(f0_of "$1")"
+}
+
+# ---- generation -------------------------------------------------------------
+emotion_set() {
+  case "$1" in
+    Calm)      GEN_TOPP=0.90; GEN_RP=1.30; T_DTMP=0.65 ;;
+    Confident) GEN_TOPP=0.92; GEN_RP=1.25; T_DTMP=0.75 ;;
+    Excited)   GEN_TOPP=0.98; GEN_RP=1.10; T_DTMP=0.95 ;;
+    Serious)   GEN_TOPP=0.90; GEN_RP=1.35; T_DTMP=0.70 ;;
+    *)         GEN_TOPP=0.95; GEN_RP=1.20; T_DTMP=0.80 ;;
+  esac
+  GEN_TOPK=1000; GEN_NPRED=""; GEN_EMO="$1"
+}
+
+profiles() {
+  local d
+  for d in "$VOICES"/*/; do
+    [ -f "$d/embedding.npy" ] || continue
+    basename "$d"
+  done | sort
+}
+
+pick_profile() {
+  local list; list=$(profiles)
+  if [ -z "$list" ]; then
+    info "No cloned voices yet."
+    gum confirm "Clone one now?" && clone_flow || return 1
+    list=$(profiles)
+    [ -n "$list" ] || return 1
+  fi
+  printf '%s\n' "$list" | gum filter --header "Voice profile" --placeholder "type to search" --height 10
+}
+
+get_text() {
+  local mode
+  mode=$(gum choose --header "Text source" "Type / paste" "Load from a file" "Back") || return 1
+  case "$mode" in
+    "Type / paste")
+      gum write --width 90 --height 12 --char-limit 0 \
+        --placeholder "Type the script. Ctrl+D to finish." ;;
+    "Load from a file")
+      local f; f=$(gum file --file "$HOME" --height 14) || return 1
+      cat "$f" ;;
+    *) return 1 ;;
+  esac
+}
+
+generate() {  # $1 profile, $2 text, $3 seed, $4 temp -> echoes wav path
+  local profile="$1" text="$2" seed="${3:-$RANDOM}" temp="${4:-0.8}"
+  local out="$STATE/take_$seed.wav" tf="$STATE/gen_text.txt"
+  rm -f "$out"
+  printf '%s' "$text" >"$tf"
+  local args=(--model "$MODEL" --s3gen-gguf "$S3GEN" --ref-dir "$VOICES/$profile"
+              --text "$text" --out "$out" --seed "$seed" --temp "$temp" --threads "$THREADS")
+  [ -n "$GEN_TOPK" ]  && args+=(--top-k "$GEN_TOPK")
+  [ -n "$GEN_TOPP" ]  && args+=(--top-p "$GEN_TOPP")
+  [ -n "$GEN_RP" ]    && args+=(--repeat-penalty "$GEN_RP")
+  [ -n "$GEN_NPRED" ] && args+=(--n-predict "$GEN_NPRED")
+  local runner; runner=$(prepare_runner "${args[@]}")
+  run_runner "$runner" "$STATE/last.log" "Generating · $profile · $GEN_EMO · seed $seed · temp $temp" || return 1
+  [ -s "$out" ] || { info "no output"; return 1; }
+  echo "$out"
+}
+
+keep_take() {
+  local src="$1" profile="$2" seed="$3"
+  local name; name=$(gum input --prompt "Save as (without .wav) " \
+    --value "${profile}_$(date +%Y%m%d-%H%M)_s${seed}")
+  [ -n "$name" ] || return 1
+  name="${name// /_}"
+  case "$name" in */*|.|..) info "invalid name"; return 1 ;; esac
+  [ -e "$OUT/$name.wav" ] && name="$name-$(date +%H%M%S)"
+  cp "$src" "$OUT/$name.wav"
+  ok "saved → $OUT/$name.wav"
+}
+
+audition() {
+  local profile="$1" text="$2" seed="$3" temp="$4"
+  local take="$5"
+  while true; do
+    local d; d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$take" 2>/dev/null || echo "?")
+    header
+    gum style --foreground 245 "  $profile · $GEN_EMO · seed $seed · temp $temp · ${d}s"
+    local act
+    act=$(gum choose --header "Take" "▶  Play" "★  Keep" "🎛  Tune / master this take" "↻  New seed" "⇄  A/B another take" "✎  Edit text" "←  Back") || return 1
+    case "$act" in
+      "▶  Play") play_file "$take" ;;
+      "★  Keep") keep_take "$take" "$profile" "$seed" ;;
+      "🎛  Tune / master this take") tune_menu "$take" ;;
+      "↻  New seed")
+        seed=$RANDOM
+        take=$(generate "$profile" "$text" "$seed" "$temp") || return 1
+        ;;
+      "⇄  A/B another take")
+        local seed2=$RANDOM
+        local take2; take2=$(generate "$profile" "$text" "$seed2" "$temp") || return 1
+        while true; do
+          local pick
+          pick=$(gum choose --header "A/B  (A = seed $seed, B = seed $seed2)" "Play A" "Play B" "Keep A" "Keep B" "Back") || break
+          case "$pick" in
+            "Play A") play_file "$take" ;;
+            "Play B") play_file "$take2" ;;
+            "Keep A") keep_take "$take" "$profile" "$seed" ;;
+            "Keep B") keep_take "$take2" "$profile" "$seed2" ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      "✎  Edit text")
+        local nt; nt=$(get_text) || return 1
+        if [ -n "$nt" ]; then text="$nt"; printf '%s' "$text" >"$STATE/text.txt"; fi
+        take=$(generate "$profile" "$text" "$seed" "$temp") || return 1
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+gen_flow() {
+  local profile; profile=$(pick_profile) || return 0
+  header
+  local text; text=$(get_text) || return 0
+  [ -n "${text//[[:space:]]/}" ] || { info "empty text"; pause; return 0; }
+  printf '%s' "$text" >"$STATE/text.txt"
+  local emo
+  emo=$(gum choose --header "Emotion style (engine-side)" \
+    "Neutral (default)" "Calm" "Confident" "Excited" "Serious" "🎛 Custom knobs") || return 0
+  local T_DTMP=0.8
+  case "$emo" in
+    "🎛 Custom knobs")
+      GEN_EMO="Custom"
+      local t
+      t=$(gum input --prompt "Temp (0.5-1.1) " --value "0.8");      num "$t" && T_DTMP="$t"
+      t=$(gum input --prompt "Top-p (0.80-1.0) " --value "$GEN_TOPP"); num "$t" && GEN_TOPP="$t"
+      t=$(gum input --prompt "Repeat penalty " --value "$GEN_RP");     num "$t" && GEN_RP="$t"
+      t=$(gum input --prompt "Top-k " --value "$GEN_TOPK");           num "$t" && GEN_TOPK="$t"
+      t=$(gum input --prompt "Max tokens (blank=1000) " --value "$GEN_NPRED")
+      if num "$t"; then GEN_NPRED="$t"; elif [ -z "$t" ]; then GEN_NPRED=""; fi
+      ;;
+    "Neutral (default)") emotion_set Neutral ;;
+    *) emotion_set "$emo" ;;
+  esac
+  local seed; seed=$(gum input --prompt "Seed " --value "$RANDOM")
+  num "$seed" || seed=$RANDOM
+  local take; take=$(generate "$profile" "$text" "$seed" "$T_DTMP") || { pause; return 0; }
+  audition "$profile" "$text" "$seed" "$T_DTMP" "$take"
+}
+
+# ---- tuning studio ----------------------------------------------------------
+tune_apply_preset() {
+  T_BODY=0
+  case "$1" in
+    Cinematic) T_WARM=2; T_PRES=-1; T_HARSH=-1.5; T_REV=18; T_COMP=35; T_LUFS=-16.5; T_TEMPO=1; T_PITCH=0 ;;
+    Dramatic)  T_WARM=3; T_PRES=0;  T_HARSH=-2;   T_REV=30; T_COMP=55; T_LUFS=-15.5; T_TEMPO=1; T_PITCH=0 ;;
+    Smooth)    T_WARM=0; T_PRES=-1.5; T_HARSH=-3.5; T_REV=6; T_COMP=30; T_LUFS=-16.5; T_TEMPO=0.98; T_PITCH=0 ;;
+    Warm)      T_WARM=3; T_PRES=-1; T_HARSH=0;    T_REV=10; T_COMP=20; T_LUFS=0; T_TEMPO=1; T_PITCH=0 ;;
+    Intense)   T_WARM=1; T_PRES=2.5; T_HARSH=-1;  T_REV=8;  T_COMP=50; T_LUFS=-15; T_TEMPO=1; T_PITCH=0 ;;
+    Space)     T_WARM=1; T_PRES=-1; T_HARSH=-2;   T_REV=45; T_COMP=25; T_LUFS=-17; T_TEMPO=1; T_PITCH=0 ;;
+    *)         T_WARM=0; T_PRES=0;  T_HARSH=0;    T_REV=0;  T_COMP=0;  T_LUFS=0; T_TEMPO=1; T_PITCH=0 ;;
+  esac
+  T_PRESET="$1"
+}
+
+build_filters() {
+  local parts=()
+  if awk -v a="$T_PITCH" 'BEGIN{exit !(a!=0)}' || awk -v a="$T_TEMPO" 'BEGIN{exit !(a!=1)}'; then
+    local pf; pf=$(awk -v st="$T_PITCH" 'BEGIN{printf "%.6f", 2^(st/12)}')
+    parts+=("rubberband=pitch=$pf:tempo=$T_TEMPO:transients=smooth")
+  fi
+  awk -v v="$T_WARM"  'BEGIN{exit !(v!=0)}' && parts+=("bass=g=${T_WARM}:f=120:w=0.7")
+  awk -v v="$T_BODY"  'BEGIN{exit !(v!=0)}' && parts+=("equalizer=f=250:t=q:w=1:g=${T_BODY}")
+  awk -v v="$T_PRES"  'BEGIN{exit !(v!=0)}' && parts+=("treble=g=${T_PRES}:f=6000:w=0.7")
+  awk -v v="$T_HARSH" 'BEGIN{exit !(v!=0)}' && parts+=("equalizer=f=3200:t=q:w=1.2:g=${T_HARSH}")
+  if awk -v v="$T_COMP" 'BEGIN{exit !(v>0)}'; then
+    local th r mk
+    th=$(awk -v v="$T_COMP" 'BEGIN{printf "%.1f", -12-12*v/100}')
+    r=$(awk -v v="$T_COMP" 'BEGIN{printf "%.2f", 1.5+1.5*v/100}')
+    mk=$(awk -v v="$T_COMP" 'BEGIN{printf "%.2f", 1.0+0.3*v/100}')
+    parts+=("acompressor=threshold=${th}dB:ratio=${r}:attack=15:release=200:makeup=${mk}")
+  fi
+  local IFS=,
+  echo "${parts[*]:-}"
+}
+
+_tune_render() {  # $1 base, $2 pre-chain, $3 post-chain, $4 dst, $5 skip reverb
+  local base="$1" pre="$2" post="$3" dst="$4" norev="${5:-}"
+  local full="${pre:+$pre}${post:+${pre:+,}$post}"
+  full="${full:-anull}"
+  if [ -z "$norev" ] && awk -v v="$T_REV" 'BEGIN{exit !(v>0)}'; then
+    local wet; wet=$(awk -v v="$T_REV" 'BEGIN{printf "%.3f", v/100}')
+    local tir="$STATE/ir_wet.wav"
+    python3 "$MKIR" "$IR" "$wet" "$tir" 2>/dev/null || { info "IR build failed"; return 1; }
+    ffmpeg -y -v error -i "$base" -i "$tir" -filter_complex \
+      "[0:a]${full}[a];[a][1:a]afir=gtype=none:irnorm=0[out]" \
+      -map "[out]" -c:a pcm_s16le "$dst"
+  else
+    if [ "$full" = "anull" ]; then cp "$base" "$dst"
+    else ffmpeg -y -v error -i "$base" -af "$full" -c:a pcm_s16le "$dst"; fi
+  fi
+}
+
+render_tuned() {  # $1 src, $2 dst — never touches src
+  local src="$1" dst="$2"
+  local base="$STATE/tune_base.wav"
+  ffmpeg -y -v error -i "$src" -ar 24000 -ac 1 -c:a pcm_s16le "$base" || { info "ffmpeg decode failed"; return 1; }
+  local pre; pre=$(build_filters)
+  local pass1="$STATE/tune_pass1.wav"
+  _tune_render "$base" "$pre" "" "$pass1" || { info "render failed"; return 1; }
+  local post=""
+  if awk -v v="$T_LUFS" 'BEGIN{exit !(v<0)}'; then
+    local m; m=$(measure_it "$pass1")
+    local I="${m%% *}" TP="${m##* }"
+    local G; G=$(awk -v t="$T_LUFS" -v i="$I" 'BEGIN{printf "%.2f", t-i}')
+    local np; np=$(awk -v p="$TP" -v g="$G" 'BEGIN{printf "%.2f", p+g}')
+    post="volume=${G}dB"
+    awk -v v="$np" 'BEGIN{exit !(v>-1.0)}' && post="$post,alimiter=limit=0.75:level=0,volume=-0.5dB"
+  fi
+  _tune_render "$pass1" "" "$post" "$dst" 1 || { info "render failed"; return 1; }
+  if awk -v v="$T_LUFS" 'BEGIN{exit !(v<0)}'; then
+    local m2; m2=$(measure_it "$dst")
+    local I2="${m2%% *}" TP2="${m2##* }"
+    local G2; G2=$(awk -v t="$T_LUFS" -v i="$I2" 'BEGIN{printf "%.2f", t-i}')
+    if awk -v g="$G2" 'BEGIN{d=g<0?-g:g; exit !(d>0.35)}'; then
+      local tmp="$STATE/tune_post.wav" rpost np2
+      rpost="volume=${G2}dB"
+      np2=$(awk -v p="$TP2" -v g="$G2" 'BEGIN{printf "%.2f", p+g}')
+      awk -v v="$np2" 'BEGIN{exit !(v>-1.0)}' && rpost="$rpost,alimiter=limit=0.75:level=0,volume=-0.5dB"
+      _tune_render "$dst" "" "$rpost" "$tmp" 1 && mv "$tmp" "$dst"
+    fi
+  fi
+}
+
+tune_summary() {
+  gum style --foreground 245 "  preset $T_PRESET   pitch $T_PITCH st   tempo $T_TEMPO"
+  gum style --foreground 245 "  warmth $T_WARM dB   presence $T_PRES dB   de-harsh $T_HARSH dB"
+  gum style --foreground 245 "  reverb $T_REV%   compress $T_COMP%   loudness $( [ "$T_LUFS" = 0 ] && echo off || echo "$T_LUFS LUFS" )"
+}
+
+tune_adjust() {
+  local opt
+  opt=$(gum choose --header "Adjust" \
+    "Pitch (semitones)     $T_PITCH" \
+    "Tempo                 $T_TEMPO" \
+    "Warmth dB @120Hz      $T_WARM" \
+    "Body dB @250Hz        $T_BODY" \
+    "Presence dB @6kHz     $T_PRES" \
+    "De-harsh dB @3.2kHz   $T_HARSH" \
+    "Reverb %              $T_REV" \
+    "Compress %            $T_COMP" \
+    "Loudness LUFS (0=off) $T_LUFS" \
+    "←  Back") || return 0
+  local label="${opt%% *}" val prompt cur
+  case "$label" in
+    Pitch)     cur="$T_PITCH";  prompt="Pitch semitones (-6..6) " ;;
+    Tempo)     cur="$T_TEMPO";  prompt="Tempo (0.8=slower, 1=normal) " ;;
+    Warmth)    cur="$T_WARM";   prompt="Warmth dB " ;;
+    Body)      cur="$T_BODY";   prompt="Body dB (chest/weight) " ;;
+    Presence)  cur="$T_PRES";   prompt="Presence dB " ;;
+    De-harsh)  cur="$T_HARSH";  prompt="De-harsh dB (negative smooths) " ;;
+    Reverb)    cur="$T_REV";    prompt="Reverb wet % " ;;
+    Compress)  cur="$T_COMP";   prompt="Compress % " ;;
+    Loudness)  cur="$T_LUFS";   prompt="Target LUFS (0=off) " ;;
+    *) return 0 ;;
+  esac
+  val=$(gum input --prompt "$prompt" --value "$cur")
+  num "$val" || { info "not a number"; return 0; }
+  case "$label" in
+    Pitch)     T_PITCH="$val" ;;
+    Tempo)     T_TEMPO="$val" ;;
+    Warmth)    T_WARM="$val" ;;
+    Body)      T_BODY="$val" ;;
+    Presence)  T_PRES="$val" ;;
+    De-harsh)  T_HARSH="$val" ;;
+    Reverb)    T_REV="$val" ;;
+    Compress)  T_COMP="$val" ;;
+    Loudness)  T_LUFS="$val" ;;
+  esac
+  T_PRESET="custom"
+}
+
+tune_match_f0() {
+  local base="$STATE/tune_base.wav"
+  [ -s "$base" ] || { info "no base rendered yet — Apply once first"; return 0; }
+  local cur; cur=$(f0_of "$base")
+  local tgt; tgt=$(gum input --prompt "Target F0 Hz " --value "133.3")
+  num "$tgt" || { info "not a number"; return 0; }
+  local probe="$STATE/tune_probe.wav" st=0 pass f
+  for pass in 1 2 3; do
+    f=$(awk -v t="$tgt" -v c="$cur" 'BEGIN{ if(c<=0){print 0; exit} printf "%.4f", log(t/c)/log(2)*12 }')
+    st=$(awk -v a="$st" -v b="$f" 'BEGIN{printf "%.3f", a+b}')
+    ffmpeg -y -v error -i "$base" -af "rubberband=pitch=$(awk -v s="$st" 'BEGIN{printf "%.6f", 2^(s/12)}'):tempo=$T_TEMPO:transients=smooth" \
+      -c:a pcm_s16le "$probe" 2>/dev/null || return 1
+    cur=$(f0_of "$probe")
+    gum style --foreground 245 "  pass $pass: pitch $st st → F0 ${cur} Hz (target $tgt)"
+    awk -v c="$cur" -v t="$tgt" 'BEGIN{d=c-t; if(d<0)d=-d; exit !(d>1.5)}' || break
+  done
+  T_PITCH="$st"
+  T_PRESET="custom"
+  ok "pitch set to $st semitones — Apply to render"
+}
+
+tune_export() {
+  local src="$1"
+  local base; base=$(basename "$src" .wav)
+  local name; name=$(gum input --prompt "Export name (without .wav) " --value "${base}_${T_PRESET}")
+  [ -n "$name" ] || return 0
+  name="${name// /_}"
+  case "$name" in */*|.|..) info "invalid name"; return 1 ;; esac
+  [ -e "$OUT/$name.wav" ] && name="$name-$(date +%H%M%S)"
+  cp "$src" "$OUT/$name.wav"
+  ok "exported → $OUT/$name.wav"
+}
+
+tune_menu() {
+  local src="$1"
+  local tuned=""
+  T_PRESET="custom"
+  tune_apply_preset Reset
+  T_PRESET="custom"
+  header
+  ffmpeg -y -v error -i "$src" -ar 24000 -ac 1 -c:a pcm_s16le "$STATE/tune_base.wav" 2>/dev/null || { info "cannot decode $src"; return 1; }
+  local src_f0; src_f0=$(f0_of "$STATE/tune_base.wav")
+  while true; do
+    header
+    gum style --foreground 245 "  source: $(basename "$src")   F0 ${src_f0} Hz"
+    tune_summary
+    local act
+    act=$(gum choose --header "Tuning" \
+      "▶  Play source" \
+      "▶  Play tuned" \
+      "🎚  Adjust knobs" \
+      "✨  Presets" \
+      "🎯  Match target F0" \
+      "🧹  Denoise source (fan)" \
+      "⚙  Apply (render + play)" \
+      "💾  Export" \
+      "↺  Reset" \
+      "←  Back") || return 0
+    case "$act" in
+      "▶  Play source") play_file "$src" ;;
+      "▶  Play tuned") [ -n "$tuned" ] && play_file "$tuned" || info "nothing rendered yet — Apply" ;;
+      "🎚  Adjust knobs") tune_adjust; tuned="" ;;
+      "✨  Presets")
+        local p
+        p=$(gum choose --header "Preset" "Cinematic" "Dramatic" "Smooth" "Warm" "Intense" "Space" "Reset" "←  Back") || continue
+        [ "$p" = "←  Back" ] && continue
+        tune_apply_preset "$p"; ok "preset: $p"; tuned="" ;;
+      "🎯  Match target F0") tune_match_f0; tuned="" ;;
+      "🧹  Denoise source (fan)")
+        local dn="$STATE/denoised-$(date +%H%M%S).wav"
+        if denoise_file "$src" "$dn"; then
+          src="$dn"; src_f0=$(f0_of "$src"); tuned=""
+          ok "denoised → $dn"
+        else
+          info "denoise failed"
+        fi ;;
+      "⚙  Apply (render + play)")
+        tuned="$STATE/tuned.wav"
+        if render_tuned "$src" "$tuned"; then
+          gum style --foreground 245 "  $(metrics_of "$tuned")"
+          play_file "$tuned"
+        fi ;;
+      "💾  Export")
+        if [ -n "$tuned" ]; then tune_export "$tuned"; else info "render first (Apply)"; fi ;;
+      "↺  Reset") tune_apply_preset Reset; T_PRESET="custom"; ok "reset"; tuned="" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+tune_flow() {
+  local src
+  src=$(gum choose --header "Tune which audio?" "Last generated take" "Pick a file" "←  Back") || return 0
+  case "$src" in
+    "Last generated take")
+      src=$(ls -t "$STATE"/take_*.wav 2>/dev/null | head -1)
+      [ -n "$src" ] || { info "no takes yet — generate something first"; pause; return 0; } ;;
+    "Pick a file")
+      src=$(gum file --file "$HOME" --height 14) || return 0 ;;
+    *) return 0 ;;
+  esac
+  tune_menu "$src"
+}
+
+# ---- cloning ----------------------------------------------------------------
+record_ref() {
+  local secs
+  secs=$(gum input --prompt "Seconds to record " --value "20" --placeholder "10-30")
+  [[ "$secs" =~ ^[0-9]+$ ]] && [ "$secs" -ge 5 ] && [ "$secs" -le 30 ] || { info "pick 5-30 s"; return 1; }
+  local raw="$STATE/ref_raw.wav"
+  header
+  gum style --foreground "$PINK" "  Recording ${secs}s — speak now."
+  gum style --foreground 245 "  Read a paragraph naturally, same mic distance, no music."
+  gum style --foreground 245 "  Fan/AC noise is removed automatically after recording."
+  sleep 1
+  timeout "$secs" pw-record --rate 48000 --channels 1 "$raw" 2>/dev/null || true
+  [ -s "$raw" ] || { info "recording failed"; return 1; }
+  echo "$raw"
+}
+
+process_ref() {
+  local raw="$1"
+  local dn="$STATE/ref_dn.wav" dlabel="afftdn"
+  [ -s "$RNNMODEL" ] && dlabel="rnnoise"
+  if denoise_file "$raw" "$dn"; then
+    gum style --foreground 245 "  denoised ($dlabel) — fan/AC/room noise reduced"
+  else
+    info "denoise skipped"; dn="$raw"
+  fi
+  local mid="$STATE/ref_trim.wav" out="$STATE/ref_ref.wav"
+  ffmpeg -y -v error -i "$dn" -af \
+    "highpass=f=70,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.15,areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.15,areverse,atrim=0:30" \
+    -ar 24000 -ac 1 "$mid" 2>/dev/null || { info "ffmpeg failed"; return 1; }
+  local peak
+  peak=$(ffmpeg -i "$mid" -af volumedetect -f null - 2>&1 | sed -n 's/.*max_volume: \(-\?[0-9.]*\) dB/\1/p' | tail -1)
+  local gain; gain=$(awk -v p="${peak:-0}" 'BEGIN{printf "%.1f", -3-p}')
+  ffmpeg -y -v error -i "$mid" -af "volume=${gain}dB" -ar 24000 -ac 1 "$out" 2>/dev/null
+  local dur; dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out")
+  local rms
+  rms=$(ffmpeg -i "$out" -af astats=metadata=1:reset=0 -f null - 2>&1 | sed -n 's/.*RMS level dB: \(-\?[0-9.]*\)/\1/p' | tail -1)
+  gum style --foreground 245 "  processed: ${dur}s  peak ${peak} dB  rms ${rms:-?} dB"
+  awk -v d="$dur" 'BEGIN{exit !(d<6)}' && { info "too short (<6 s) — record again"; return 1; }
+  echo "$out"
+}
+
+clone_from() {
+  local ref="$1" name="$2"
+  [[ "$name" =~ ^[a-z0-9_-]+$ ]] || { info "invalid voice name (a-z 0-9 _ -)"; return 1; }
+  mkdir -p "$VOICES/$name"
+  local test="$STATE/clone_test.wav"
+  local runner; runner=$(prepare_runner --model "$MODEL" --s3gen-gguf "$S3GEN" \
+    --reference-audio "$ref" --save-voice "$VOICES/$name" \
+    --text "This is my cloned voice speaking." --out "$test" --seed 1 --threads "$THREADS")
+  run_runner "$runner" "$STATE/clone.log" "Building voice embedding · $name" || return 1
+  [ -f "$VOICES/$name/embedding.npy" ] || { info "embedding not created"; return 1; }
+  ok "voice ready: $name"
+  play_file "$test"
+}
+
+clone_flow() {
+  header
+  gum style --foreground 245 "  Clone a voice you have permission to use."
+  local mode
+  mode=$(gum choose --header "Reference" "🎙  Record from microphone" "📁  Use an audio file" "←  Back") || return 0
+  local ref=""
+  case "$mode" in
+    "🎙  Record from microphone")
+      local raw; raw=$(record_ref) || { pause; return 0; }
+      ref=$(process_ref "$raw") || { pause; return 0; }
+      ;;
+    "📁  Use an audio file")
+      local f; f=$(gum file --file "$HOME" --height 14) || return 0
+      ref=$(process_ref "$f") || { pause; return 0; }
+      ;;
+    *) return 0 ;;
+  esac
+  local name
+  name=$(gum input --prompt "Voice name " --placeholder "e.g. my_voice")
+  [[ "$name" =~ ^[a-z0-9_-]+$ ]] || { info "use lowercase letters, digits, _ or -"; pause; return 0; }
+  [ -d "$VOICES/$name" ] && { gum confirm "Overwrite '$name'?" || return 0; }
+  clone_from "$ref" "$name" || { pause; return 0; }
+  gum confirm "Save this reference clip too?" && cp "$ref" "$VOICES/$name/reference.wav"
+  pause
+}
+
+manage_flow() {
+  local profile; profile=$(pick_profile) || return 0
+  local dir="$VOICES/$profile"
+  local dur="?"
+  [ -f "$dir/reference.wav" ] && dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$dir/reference.wav" 2>/dev/null || echo "?")
+  header
+  gum style --foreground 245 "  $profile   reference ${dur}s   tensors: $(ls "$dir"/*.npy 2>/dev/null | wc -l)"
+  local act
+  act=$(gum choose --header "Profile" "▶  Play reference" "✎  Rename" "🗑  Delete" "←  Back") || return 0
+  case "$act" in
+    "▶  Play reference")
+      if [ -f "$dir/reference.wav" ]; then play_file "$dir/reference.wav"; else info "no reference.wav stored"; fi
+      pause ;;
+    "✎  Rename")
+      local nn; nn=$(gum input --prompt "New name " --value "$profile")
+      if [[ "$nn" =~ ^[a-z0-9_-]+$ ]] && [ ! -d "$VOICES/$nn" ]; then mv "$dir" "$VOICES/$nn"; ok "renamed"; else info "invalid or exists"; fi
+      pause ;;
+    "🗑  Delete")
+      gum confirm "Delete '$profile' permanently?" && rm -rf "$dir" && ok "deleted"
+      pause ;;
+  esac
+}
+
+# ---- cli --------------------------------------------------------------------
+check() {
+  echo "root:    $ROOT"
+  echo "binary:  $BIN $([ -x "$BIN" ] && echo OK || echo MISSING)"
+  echo "models:  $([ -s "$MODEL" ] && echo OK || echo MISSING) $([ -s "$S3GEN" ] && echo OK || echo MISSING)"
+  echo "ir:      $IR $([ -s "$IR" ] && echo OK || echo MISSING)"
+  echo "f0.py:   $F0PY $([ -s "$F0PY" ] && echo OK || echo MISSING)"
+  echo "rnnoise: $RNNMODEL $([ -s "$RNNMODEL" ] && echo OK || echo "MISSING (fallback afftdn)")"
+  echo "threads: $THREADS"
+  echo "player:  $(command -v pw-play || command -v ffplay || echo none)"
+  echo "recorder:$(command -v pw-record || echo none)"
+  echo "gum:     $(command -v gum || echo none)"
+  echo "ffmpeg:  $(command -v ffmpeg || echo none) / ffprobe $(command -v ffprobe || echo none)"
+  echo "python3: $(command -v python3 || echo none)  numpy $(python3 -c 'import numpy' 2>/dev/null && echo OK || echo MISSING)"
+  local flt; flt=$(ffmpeg -hide_banner -filters 2>/dev/null || true)
+  echo "filters: rubberband $(grep -qw rubberband <<<"$flt" && echo OK || echo MISSING)  arnndn $(grep -qw arnndn <<<"$flt" && echo OK || echo MISSING)  afir $(grep -qw afir <<<"$flt" && echo OK || echo MISSING)  alimiter $(grep -qw alimiter <<<"$flt" && echo OK || echo MISSING)"
+  echo "timeout: $(command -v timeout || echo none)"
+  echo "voices:"
+  profiles | sed 's/^/  - /'
+  [ -n "$(profiles)" ] || echo "  (none)"
+}
+
+cli_say() {
+  local text="" profile="" seed="$RANDOM" temp="0.8" out="" emo="Neutral"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --text) take_val "$@"; text="$2"; shift 2 ;;
+      --profile) take_val "$@"; profile="$2"; shift 2 ;;
+      --seed) take_val "$@"; seed="$2"; shift 2 ;;
+      --temp) take_val "$@"; temp="$2"; shift 2 ;;
+      --emotion) take_val "$@"; emo="$2"; shift 2 ;;
+      --out) take_val "$@"; out="$2"; shift 2 ;;
+      *) text="$1"; shift ;;
+    esac
+  done
+  [ -n "$text" ] && [ -n "$profile" ] || die "usage: voicebox --say TEXT --profile NAME [--seed N] [--temp T] [--emotion STYLE] [--out FILE]"
+  [ -f "$VOICES/$profile/embedding.npy" ] || die "unknown profile: $profile"
+  emotion_set "$emo"
+  if [ "$emo" != "Neutral" ] && [ "$temp" = "0.8" ]; then temp="$T_DTMP"; fi
+  out="${out:-$OUT/${profile}_$(date +%Y%m%d-%H%M%S)_s${seed}.wav}"
+  printf '%s' "$text" >"$STATE/text.txt"
+  local take; take=$(generate "$profile" "$text" "$seed" "$temp") || exit 1
+  mkdir -p "$(dirname "$out")"; cp "$take" "$out"
+  echo "$out"
+}
+
+cli_tune() {
+  local src="" out="" preset=""
+  local argv=("$@")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --preset) take_val "$@"; preset="$2"; shift 2 ;;
+      --out) take_val "$@"; out="$2"; shift 2 ;;
+      --pitch|--tempo|--warm|--body|--pres|--harsh|--rev|--comp|--lufs) take_val "$@"; shift 2 ;;
+      *) src="$1"; shift ;;
+    esac
+  done
+  [ -f "$src" ] || die "usage: voicebox --tune FILE [--preset NAME] [--out FILE] [--pitch st --tempo X --warm dB --body dB --pres dB --harsh dB --rev % --comp % --lufs LUFS]"
+  T_PRESET="custom"
+  if [ -n "$preset" ]; then
+    case "$preset" in
+      Cinematic|Dramatic|Smooth|Warm|Intense|Space|Reset) tune_apply_preset "$preset" ;;
+      *) die "unknown preset: $preset (see --presets)" ;;
+    esac
+  fi
+  set -- "${argv[@]}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pitch) take_val "$@"; T_PITCH="$2"; shift 2 ;;
+      --tempo) take_val "$@"; T_TEMPO="$2"; shift 2 ;;
+      --warm) take_val "$@"; T_WARM="$2"; shift 2 ;;
+      --body) take_val "$@"; T_BODY="$2"; shift 2 ;;
+      --pres) take_val "$@"; T_PRES="$2"; shift 2 ;;
+      --harsh) take_val "$@"; T_HARSH="$2"; shift 2 ;;
+      --rev) take_val "$@"; T_REV="$2"; shift 2 ;;
+      --comp) take_val "$@"; T_COMP="$2"; shift 2 ;;
+      --lufs) take_val "$@"; T_LUFS="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local v
+  for v in "$T_PITCH" "$T_TEMPO" "$T_WARM" "$T_BODY" "$T_PRES" "$T_HARSH" "$T_REV" "$T_COMP" "$T_LUFS"; do
+    num "$v" || die "not a number: $v"
+  done
+  out="${out:-$OUT/$(basename "$src" .wav)_$T_PRESET.wav}"
+  [ -e "$out" ] && out="${out%.wav}-$(date +%H%M%S).wav"
+  mkdir -p "$(dirname "$out")"
+  render_tuned "$src" "$out" || exit 1
+  echo "$out"
+  echo "  $(metrics_of "$out")"
+}
+
+presets_list() {
+  echo "presets: Cinematic Dramatic Smooth Warm Intense Space Reset"
+  echo "params : pitch(semitones) tempo warmth(dB@120) body(dB@250) presence(dB@6k) de-harsh(dB@3.2k) reverb(%) compress(%) loudness(LUFS)"
+  echo "note   : source files are never modified; every render/export is a new file"
+}
+
+cli_denoise() {
+  local src="" out="" mix="$DN_MIX"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) take_val "$@"; out="$2"; shift 2 ;;
+      --mix) take_val "$@"; mix="$2"; shift 2 ;;
+      *) src="$1"; shift ;;
+    esac
+  done
+  [ -f "$src" ] || die "usage: voicebox --denoise FILE [--out FILE] [--mix 0-1]"
+  num "$mix" || die "not a number: --mix $mix"
+  DN_MIX="$mix"
+  out="${out:-$(dirname "$src")/$(basename "$src" .wav)_denoised.wav}"
+  [ -e "$out" ] && out="${out%.wav}-$(date +%H%M%S).wav"
+  denoise_file "$src" "$out" || die "denoise failed"
+  echo "$out"
+  echo "  $(metrics_of "$out")"
+}
+
+main() {
+  case "${1:-}" in
+    --check) check; exit 0 ;;
+    --presets) presets_list; exit 0 ;;
+    --f0) [ -f "${2:-}" ] || die "usage: voicebox --f0 FILE"; f0_of "$2"; exit 0 ;;
+    --say) shift; cli_say "$@"; exit 0 ;;
+    --tune) shift; cli_tune "$@"; exit 0 ;;
+    --denoise) shift; cli_denoise "$@"; exit 0 ;;
+    --clone)
+      shift
+      [ -f "${1:-}" ] && [ -n "${2:-}" ] || die "usage: voicebox --clone FILE NAME"
+      clone_from "$1" "$2" || exit 1; exit 0 ;;
+    -h|--help)
+      echo "voicebox — terminal voice studio"
+      echo "  voicebox                      interactive TUI"
+      echo "  voicebox --check              dependency + profile check"
+      echo "  voicebox --presets            list tuning presets"
+      echo "  voicebox --f0 FILE            measured F0 (Hz)"
+      echo "  voicebox --say TEXT --profile NAME [--seed N] [--temp T] [--emotion STYLE] [--out FILE]"
+      echo "  voicebox --denoise FILE [--out FILE] [--mix 0-1]   remove fan/AC noise"
+      echo "  voicebox --clone FILE NAME    build a profile from an audio file"
+      echo "  voicebox --tune FILE [--preset NAME] [--out FILE] [--pitch st --tempo X --warm dB --body dB --pres dB --harsh dB --rev % --comp % --lufs LUFS]"
+      exit 0 ;;
+  esac
+  while true; do
+    header
+    local act
+    act=$(gum choose --header "Menu" \
+      "🎬  Generate speech" \
+      "🎛  Tuning studio" \
+      "🎙  Clone a new voice" \
+      "🎚  Manage voices" \
+      "⚙  Settings" \
+      "✕  Quit") || exit 0
+    case "$act" in
+      "🎬  Generate speech") gen_flow ;;
+      "🎛  Tuning studio") tune_flow ;;
+      "🎙  Clone a new voice") clone_flow ;;
+      "🎚  Manage voices") manage_flow ;;
+      "⚙  Settings")
+        local t; t=$(gum input --prompt "CPU threads " --value "$THREADS")
+        if [[ "$t" =~ ^[0-9]+$ ]]; then THREADS="$t"; ok "threads=$THREADS"; fi
+        pause ;;
+      *) exit 0 ;;
+    esac
+  done
+}
+
+main "$@"
