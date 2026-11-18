@@ -6,11 +6,11 @@ A terminal voice studio for local voice cloning, built on [chatterbox.cpp](https
 
 ## Features
 
-- **Interactive TUI** — gum-powered menus for generating, cloning, tuning, and managing voices.
+- **Interactive TUI** — gum-powered menus for generating speech, managing profiles, and tuning takes.
 - **Local voice cloning** — record from the mic or import a clip, then build a reusable voice profile.
 - **Emotion styles** — Calm, Confident, Excited, Serious, Neutral presets over the engine's sampling params.
 - **A/B auditioning** — generate alternate seeds and keep the best take.
-- **Tuning studio** — pitch, tempo, warmth, body, presence, de-harsh, reverb, compression, and loudness targeting, plus fixed presets (Cinematic, Dramatic, Smooth, Warm, Intense, Space, Reset).
+- **Tuning studio** — parametric adjustments (pitch, tempo, EQ filters, dynamic control, with LUFS targeting), plus fixed presets (Cinematic, Dramatic, Smooth, Warm, Intense, Space, Reset).
 - **Loudness and F0 measurement** — EBU R128 integrated loudness, true peak, and median F0 of every take.
 - **Denoise** — rnnoise when a model is present, afftdn otherwise.
 - **Non-destructive** — source takes and reference clips are never modified; every render is a new file.
@@ -84,7 +84,7 @@ See **[AGENTS.md](AGENTS.md)** and **[skills/voicebox/SKILL.md](skills/voicebox/
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VOICEBOX_ROOT` | `~/voice-clone/chatterbox.cpp` | Engine, models, and voices root |
+| `VOICEBOX_ROOT` | `~/voice-clone/chatterbox.cpp` | chatterbox binary with models and voice profiles |
 | `RNNOISE_DIR` | `~/.local/share/rnnoise` | Directory holding `bd.rnnn` |
 | `RNNOISE_MODEL` | `$RNNOISE_DIR/bd.rnnn` | Explicit rnnoise model path |
 | `DN_MIX` | `0.95` | rnnoise wet/dry mix |
