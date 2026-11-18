@@ -68,6 +68,18 @@ voicebox --tune FILE [--preset NAME] [--out FILE] [--pitch st --tempo X --warm d
 
 ---
 
+## AI Agents & Automation (with Earshot)
+
+Voicebox is fully scriptable for autonomous coding agents (Claude Code, Antigravity, OpenCode, Codex, Cursor). Because LLMs cannot physically hear audio, this repository bundles **[Earshot](skills/earshot/SKILL.md)** to serve as the agent's acoustic perception:
+
+- **Audition takes across seeds**: Agents generate alternate takes (`--seed N`) and rank them using `earshot rank` or `earshot ab`.
+- **Acoustic vetting**: Reference audio is vetted for clean speech and absence of background music with `earshot find` and `earshot describe` before running `voicebox --clone`.
+- **Mastering verification**: Output LUFS and peak dynamics are verified with `earshot measure`.
+
+See **[AGENTS.md](AGENTS.md)** and **[skills/voicebox/SKILL.md](skills/voicebox/SKILL.md)** for complete agent workflows and non-interactive recipes.
+
+---
+
 ## Configuration
 
 | Variable | Default | Purpose |
